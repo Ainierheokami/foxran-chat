@@ -2,4 +2,5 @@
 /flagged
 /.vscode
 /.docker
-/lora/*
+/lora
+*.bin
