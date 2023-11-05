@@ -142,13 +142,13 @@ import traceback
 from transformers import TextIteratorStreamer
 
 
-# def clear_screen():
-#     if platform.system() == "Windows":
-#         os.system("cls")
-#     else:
-#         os.system("clear")
-#     # print(Fore.YELLOW + Style.BRIGHT + "欢迎使用百川大模型，输入进行对话，vim 多行输入，clear 清空历史，CTRL+C 中断生成，stream 开关流式生成，exit 结束。")
-#     return []
+def clear_screen():
+    if platform.system() == "Windows":
+        os.system("cls")
+    else:
+        os.system("clear")
+    # print(Fore.YELLOW + Style.BRIGHT + "欢迎使用百川大模型，输入进行对话，vim 多行输入，clear 清空历史，CTRL+C 中断生成，stream 开关流式生成，exit 结束。")
+    return []
 
 template = dict(
     SYSTEM='<|System|>:{system}\n',
@@ -158,18 +158,18 @@ template = dict(
 system_template = '你是一只可爱的小狐狸，请以可爱的形式回复消息'
 message = '你好'
 
-history = []
+history = clear_screen()
 
 def evaluate(
     prompt,
     # history,
     # input,
     temperature=0.1,
-    top_p=0.75,
-    top_k=40,
-    num_beams=3,
-    max_new_tokens=128,
-    repetition_penalty=1.0,
+    top_p=0.45,
+    top_k=80,
+    num_beams=1,
+    max_new_tokens=1024,
+    repetition_penalty=1.1,
     **kwargs,
 ):
     # prompt = template['SYSTEM'].format(system=system_template) + template["INSTRUCTION"].format(input=prompt)
@@ -190,15 +190,15 @@ def evaluate(
     )
     
     # print(generation_config)
-    # fastllm_config = {
-    #     "temperature": temperature,
-    #     "top_p": top_p,
-    #     "top_k": top_k,
-    #     "num_beams": num_beams,
-    #     "do_sample": True,
-    #     "max_time": 60,
-    #     **kwargs,
-    # }
+    fastllm_config = {
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "num_beams": num_beams,
+        "do_sample": True,
+        "max_time": 60,
+        **kwargs,
+    }
     
     # history.append({"role": "user", "content": prompt})
     
@@ -206,47 +206,35 @@ def evaluate(
     streamer = TextIteratorStreamer(tokenizer) # type: ignore
     
     try:
-        with torch.no_grad():
-            generation_output = model.generate(
-                input_ids=input_ids.cuda(),
-                generation_config=generation_config,
-                # return_dict_in_generate=True,
-                # output_scores=True,
-                # bad_words_ids=bad_words_ids,
-                # max_new_tokens=max_new_tokens,
-                repetition_penalty=float(repetition_penalty),
-                streamer=streamer
-            )
-        input_ids_len = input_ids.size(1)
-        response_ids = generation_output[:, input_ids_len:].cpu()
-        output = "".join(tokenizer.batch_decode(response_ids))
+        if USE_FASTLLM:
+            # 流式传输：
+            output = []
+            for response in model.stream_chat(tokenizer, prompt, **fastllm_config):
+                output.append(response)
+                print(response, flush = True, end = "")
+            output = "".join(output)
+
+            # # 普通Chat：
+            # output = model.chat(tokenizer, now_instruction, **fastllm_config)
+            # print(output)
+        else:
+            with torch.no_grad():
+                generation_output = model.generate(
+                    input_ids=input_ids.cuda(),
+                    generation_config=generation_config,
+                    repetition_penalty=float(repetition_penalty),
+                    streamer=streamer
+                )
+            input_ids_len = input_ids.size(1)
+            response_ids = generation_output[:, input_ids_len:].cpu()
+            output = "".join(tokenizer.batch_decode(response_ids))
         
         print('output', output)
         print('###################\n')
-
-        
-        # position = 0
-        # output = []
-        # for response in model.chat(tokenizer, messages, stream=True, generation_config=generation_config):
-        #     print(response[position:], end='', flush=True)
-        #     position = len(response)
-        #     if torch.backends.mps.is_available():
-        #         torch.mps.empty_cache()
-        #     output.append(response)
-        # print()
     
         # output = "".join(output)
         
-        # 流式传输：
-        # output = []
-        # for response in model.stream_chat(tokenizer, now_instruction, **fastllm_config):
-        #     output.append(response)
-        #     print(response, flush = True, end = "")
-        # output = "".join(output)
 
-        # # 普通Chat：
-        # output = model.chat(tokenizer, now_instruction, **fastllm_config)
-        # print(output)
 
         return [(prompt, output)]
     
@@ -269,15 +257,15 @@ demo = gr.Interface(
         # gr.components.Textbox(
         #     lines=2, label="Input", placeholder="这里输入input"
         # ),
-        gr.components.Slider(minimum=0, maximum=1, value=0.7, label="Temperature"),
+        gr.components.Slider(minimum=0, maximum=1, value=0.45, label="Temperature"),
         gr.components.Slider(minimum=0, maximum=1, value=0.9, label="Top p"),
-        gr.components.Slider(minimum=0, maximum=100, step=1, value=60, label="Top k"),
-        gr.components.Slider(minimum=1, maximum=5, step=1, value=2, label="Beams"),
+        gr.components.Slider(minimum=0, maximum=100, step=1, value=80, label="Top k"),
+        gr.components.Slider(minimum=1, maximum=5, step=1, value=1, label="Beams"),
         gr.components.Slider(
-            minimum=1, maximum=2000, step=1, value=128, label="Max new tokens"
+            minimum=1, maximum=2000, step=1, value=1024, label="Max new tokens"
         ),
         gr.components.Slider(
-            minimum=0.1, maximum=10.0, step=0.1, value=2.0, label="Repetition Penalty"
+            minimum=0.1, maximum=10.0, step=0.1, value=1.1, label="Repetition Penalty"
         ),
         # gr.components.Slider(
         #     minimum=0, maximum=2000, step=1, value=256, label="Max memory"
@@ -285,7 +273,7 @@ demo = gr.Interface(
     ],
     outputs=[chatbot],
     allow_flagging="auto",
-    title="🦊🦊🦊Chinese Bloom Lora Fox🦊🦊🦊",
-    description="🦊🦊🦊基于Bloom的中文对话生成模型🦊🦊🦊",
+    title="🦊🦊🦊自用的超简易狐妖繎chat端🦊🦊🦊",
+    description="🦊🦊🦊🦊🦊🦊",
 )
 demo.queue().launch(server_name="0.0.0.0",server_port=5000,inbrowser=True)
