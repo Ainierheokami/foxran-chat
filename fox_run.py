@@ -176,29 +176,25 @@ def evaluate(
     print('###################')
     print('Prompt内容：\n', prompt)
     
-    generation_config = GenerationConfig.from_pretrained(
-        BASE_MODEL,
-        temperature=temperature,
-        do_sample=temperature > 0,
-        top_p=top_p,
-        top_k=top_k,
-        num_beams=num_beams,
-        max_time= 60,
-        max_new_tokens=max_new_tokens,
-        # repetition_penalty=repetition_penalty,
-        **kwargs,
-    )
-    
-    # print(generation_config)
-    fastllm_config = {
+    gen_config = {
         "temperature": temperature,
         "top_p": top_p,
         "top_k": top_k,
         "num_beams": num_beams,
-        "do_sample": True,
+        "repetition_penalty": repetition_penalty,
+        "max_new_tokens": max_new_tokens,
         "max_time": 60,
+        "do_sample": temperature > 0,
         **kwargs,
     }
+
+    if os.path.isfile(os.path.join(BASE_MODEL, "generation_config.json")):
+        generation_config = GenerationConfig.from_pretrained(
+            BASE_MODEL,
+             **gen_config,
+        )
+    else:
+        generation_config = GenerationConfig(**gen_config)
     
     # history.append({"role": "user", "content": prompt})
     
@@ -209,7 +205,7 @@ def evaluate(
         if USE_FASTLLM:
             # 流式传输：
             output = []
-            for response in model.stream_chat(tokenizer, prompt, **fastllm_config):
+            for response in model.stream_chat(tokenizer, prompt, **gen_config):
                 output.append(response)
                 print(response, flush = True, end = "")
             output = "".join(output)
