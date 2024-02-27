@@ -1,13 +1,10 @@
 # 导入包
-import json
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.generation import GenerationConfig
 import os, sys
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-from datasets import load_dataset
-import transformers
-from transformers import Trainer, TrainingArguments
+
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers import BitsAndBytesConfig, AutoConfig
 
@@ -77,6 +74,7 @@ def hf_load():
         "torch_dtype": torch.float16,
         "max_memory": max_memory,
         "device_map": "auto",
+        "low_cpu_mem_usage": True,
     }
 
     if USE_FASTLLM:
@@ -111,12 +109,57 @@ def hf_load():
             trust_remote_code=True,
         )
         print('load lora is ok.')
-
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)
     print("load model finish.")
-    return model
+    return model, tokenizer
     
-model = hf_load()
-tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)
+    
+import gradio as gr
+import platform
+import traceback
+
+# from transformers import TextIteratorStreamer
+
+
+def clear_screen():
+    if platform.system() == "Windows":
+        os.system("cls")
+    else:
+        os.system("clear")
+    # print(Fore.YELLOW + Style.BRIGHT + "欢迎使用百川大模型，输入进行对话，vim 多行输入，clear 清空历史，CTRL+C 中断生成，stream 开关流式生成，exit 结束。")
+    return []
+
+internlm2_chat=dict(
+    SYSTEM='<|im_start|>system\n{system}<|im_end|>\n',
+    INSTRUCTION=('<|im_start|>user\n{input}<|im_end|>\n'
+                    '<|im_start|>assistant\n'),
+    SUFFIX='<|im_end|>',
+    SUFFIX_AS_EOS=True,
+    SEP='\n',
+    STOP_WORDS=['<|im_end|>']
+)
+
+default_template = dict(
+    SYSTEM='<|System|>system\n{system}<|End|>\n',
+    INSTRUCTION=('<|User|>user\n{input}<|End|>\n'
+                    '<|Bot|>assistant\n'),
+    SUFFIX='<|End|>',
+    SUFFIX_AS_EOS=True,
+    SEP='\n',
+    STOP_WORDS=['<|End|>']
+)
+
+template = dict(
+    SYSTEM='<|System|>:{system}\n',
+    INSTRUCTION='<|User|>:{input}<eoh>\n<|Bot|>:'
+)
+
+system_template = '你是一只可爱的小狐狸，请以可爱的形式回复消息'
+message = '你好'
+
+history = clear_screen()
+
+model,tokenizer = hf_load()
 
 if USE_FASTLLM:
     # need install fastllm 
@@ -133,32 +176,6 @@ else:
     # model.eval()
     if torch.__version__ >= "2" and sys.platform != "win32":
         model = torch.compile(model)
-    
-
-import gradio as gr
-import platform
-import traceback
-
-from transformers import TextIteratorStreamer
-
-
-def clear_screen():
-    if platform.system() == "Windows":
-        os.system("cls")
-    else:
-        os.system("clear")
-    # print(Fore.YELLOW + Style.BRIGHT + "欢迎使用百川大模型，输入进行对话，vim 多行输入，clear 清空历史，CTRL+C 中断生成，stream 开关流式生成，exit 结束。")
-    return []
-
-template = dict(
-    SYSTEM='<|System|>:{system}\n',
-    INSTRUCTION='<|User|>:{input}<eoh>\n<|Bot|>:'
-)
-
-system_template = '你是一只可爱的小狐狸，请以可爱的形式回复消息'
-message = '你好'
-
-history = clear_screen()
 
 def evaluate(
     prompt,
@@ -183,7 +200,7 @@ def evaluate(
         "num_beams": num_beams,
         "repetition_penalty": repetition_penalty,
         "max_new_tokens": max_new_tokens,
-        "max_time": 60,
+        "max_time": 30,
         "do_sample": temperature > 0,
         **kwargs,
     }
@@ -199,8 +216,38 @@ def evaluate(
     # history.append({"role": "user", "content": prompt})
     
     input_ids = tokenizer.encode(prompt, return_tensors='pt')
-    streamer = TextIteratorStreamer(tokenizer) # type: ignore
+    from transformers.generation.streamers import TextStreamer
+    from transformers import StoppingCriteria, StoppingCriteriaList
+
+    class StopWordStoppingCriteria(StoppingCriteria):
+        """StopWord stopping criteria."""
+
+        def __init__(self, tokenizer, stop_word):
+            self.tokenizer = tokenizer
+            self.stop_word = stop_word
+            self.length = len(self.stop_word)
+
+        def __call__(self, input_ids, *args, **kwargs) -> bool:
+            cur_text = self.tokenizer.decode(input_ids[0])
+            cur_text = cur_text.replace('\r', '').replace('\n', '')
+            return cur_text[-self.length:] == self.stop_word
+
+    def get_stop_criteria(
+        tokenizer,
+        stop_words=[],
+    ):
+        stop_criteria = StoppingCriteriaList()
+        for word in stop_words:
+            stop_criteria.append(StopWordStoppingCriteria(tokenizer, word))
+        return stop_criteria
     
+    stop_words:list[str] = []
+    stop_words += template.get('STOP_WORDS', [])
+    sep = template.get('SEP', '')
+    stop_criteria = get_stop_criteria(tokenizer=tokenizer, stop_words=stop_words)
+
+    streamer = TextStreamer(tokenizer, skip_prompt=True)  # type: ignore
+
     try:
         if USE_FASTLLM:
             # 流式传输：
@@ -216,12 +263,13 @@ def evaluate(
         else:
             with torch.no_grad():
                 generation_output = model.generate(
-                    input_ids=input_ids.cuda(),
+                    input_ids=input_ids.cuda(), # type: ignore
                     generation_config=generation_config,
                     repetition_penalty=float(repetition_penalty),
-                    streamer=streamer
+                    streamer=streamer,
+                    stopping_criteria=stop_criteria,
                 )
-            input_ids_len = input_ids.size(1)
+            input_ids_len = input_ids.size(1) # type: ignore
             response_ids = generation_output[:, input_ids_len:].cpu()
             output = "".join(tokenizer.batch_decode(response_ids))
         
@@ -240,36 +288,38 @@ def evaluate(
         traceback.print_exc()
         print("错误：输入的指令无法生成回复，请重新输入。") 
 
-chatbot = gr.Chatbot()
-demo = gr.Interface(
-    fn=evaluate,
-    inputs=[
-        gr.components.Textbox(
-            lines=2, label="Instruction", placeholder="在此输入任务/指令/历史", value=template['SYSTEM'].format(system=system_template) + template["INSTRUCTION"].format(input=message)
-        ),
-        # gr.components.Textbox(
-        #     lines=2, label="History", placeholder="这里输入历史记录"
-        # ),
-        # gr.components.Textbox(
-        #     lines=2, label="Input", placeholder="这里输入input"
-        # ),
-        gr.components.Slider(minimum=0, maximum=1, value=0.45, label="Temperature"),
-        gr.components.Slider(minimum=0, maximum=1, value=0.9, label="Top p"),
-        gr.components.Slider(minimum=0, maximum=100, step=1, value=80, label="Top k"),
-        gr.components.Slider(minimum=1, maximum=5, step=1, value=1, label="Beams"),
-        gr.components.Slider(
-            minimum=1, maximum=2000, step=1, value=1024, label="Max new tokens"
-        ),
-        gr.components.Slider(
-            minimum=0.1, maximum=10.0, step=0.1, value=1.1, label="Repetition Penalty"
-        ),
-        # gr.components.Slider(
-        #     minimum=0, maximum=2000, step=1, value=256, label="Max memory"
-        # ),
-    ],
-    outputs=[chatbot],
-    allow_flagging="auto",
-    title="🦊🦊🦊自用的超简易狐妖繎chat端🦊🦊🦊",
-    description="🦊🦊🦊🦊🦊🦊",
-)
-demo.queue().launch(server_name="0.0.0.0",server_port=5000,inbrowser=True)
+
+if __name__ == "__main__":
+    chatbot = gr.Chatbot()
+    demo = gr.Interface(
+        fn=evaluate,
+        inputs=[
+            gr.components.Textbox(
+                lines=2, label="Instruction", placeholder="在此输入任务/指令/历史", value=template['SYSTEM'].format(system=system_template) + template["INSTRUCTION"].format(input=message)
+            ),
+            # gr.components.Textbox(
+            #     lines=2, label="History", placeholder="这里输入历史记录"
+            # ),
+            # gr.components.Textbox(
+            #     lines=2, label="Input", placeholder="这里输入input"
+            # ),
+            gr.components.Slider(minimum=0, maximum=1, value=0.45, label="Temperature"),
+            gr.components.Slider(minimum=0, maximum=1, value=0.9, label="Top p"),
+            gr.components.Slider(minimum=0, maximum=100, step=1, value=80, label="Top k"),
+            gr.components.Slider(minimum=1, maximum=5, step=1, value=1, label="Beams"),
+            gr.components.Slider(
+                minimum=1, maximum=2000, step=1, value=1024, label="Max new tokens"
+            ),
+            gr.components.Slider(
+                minimum=0.1, maximum=10.0, step=0.1, value=1.1, label="Repetition Penalty"
+            ),
+            # gr.components.Slider(
+            #     minimum=0, maximum=2000, step=1, value=256, label="Max memory"
+            # ),
+        ],
+        outputs=[chatbot],
+        allow_flagging="auto",
+        title="🦊🦊🦊自用的超简易狐妖繎chat端🦊🦊🦊",
+        description="🦊🦊🦊🦊🦊🦊",
+    )
+    demo.queue().launch(server_name="0.0.0.0",server_port=5000,inbrowser=True)
