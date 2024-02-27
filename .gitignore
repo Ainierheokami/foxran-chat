@@ -1,6 +1,9 @@
-/test.txt
+*test*
 /flagged
 /.vscode
 /.docker
-/lora
+/lora/*
+/models/*
 *.bin
+run*.sh
+/workspace
