@@ -5,8 +5,11 @@ from transformers.generation import GenerationConfig
 import os, sys
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
+from typing import Any, List, cast
+
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers import BitsAndBytesConfig, AutoConfig
+from vllm import LLM, SamplingParams
 
 from accelerate import init_empty_weights
 # from peft import (
@@ -27,7 +30,8 @@ parser.add_argument("--model", type=str, required=True)
 parser.add_argument("--lora", type=str, default="", required=False)
 parser.add_argument("--bit8", action='store_true', default=False)
 parser.add_argument("--bit4", action='store_true', default=False)
-parser.add_argument("--fastllm", action='store_true', default=False)
+parser.add_argument("--use_fastllm", action='store_true', default=False)
+parser.add_argument("--use_vllm", action='store_true', default=False)
 args = parser.parse_args()
 
 
@@ -35,7 +39,10 @@ args = parser.parse_args()
 BASE_MODEL: str = args.model
 LORA_WEIGHTS: str = args.lora
 
-USE_FASTLLM: bool = args.fastllm
+USE_FASTLLM: bool = args.use_fastllm
+USE_VLLM: bool = args.use_vllm
+
+
 LOAD_4BIT: bool = args.bit4
 LOAD_8BIT: bool = args.bit8
 
@@ -56,6 +63,8 @@ print('Max_memory设置', max_memory)
 # 载入模型
 def hf_load():
     print('try to load model...')
+    if USE_VLLM:
+        return None,None
     nf4_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -154,6 +163,8 @@ template = dict(
     INSTRUCTION='<|User|>:{input}<eoh>\n<|Bot|>:'
 )
 
+template = internlm2_chat
+
 system_template = '你是一只可爱的小狐狸，请以可爱的形式回复消息'
 message = '你好'
 
@@ -171,7 +182,8 @@ if USE_FASTLLM:
         model = llm.from_hf(model, tokenizer, dtype = "int8")
     else:
         model = llm.from_hf(model, tokenizer)
-        
+elif USE_VLLM:
+    model = LLM(model="models/Baichuan2-7B-awq", quantization="AWQ", trust_remote_code=True)
 else:
     # model.eval()
     if torch.__version__ >= "2" and sys.platform != "win32":
@@ -179,6 +191,7 @@ else:
 
 def evaluate(
     prompt,
+    stop_word="",
     # history,
     # input,
     temperature=0.1,
@@ -192,86 +205,100 @@ def evaluate(
     # prompt = template['SYSTEM'].format(system=system_template) + template["INSTRUCTION"].format(input=prompt)
     print('###################')
     print('Prompt内容：\n', prompt)
-    
-    gen_config = {
-        "temperature": temperature,
-        "top_p": top_p,
-        "top_k": top_k,
-        "num_beams": num_beams,
-        "repetition_penalty": repetition_penalty,
-        "max_new_tokens": max_new_tokens,
-        "max_time": 30,
-        "do_sample": temperature > 0,
-        **kwargs,
-    }
-
-    if os.path.isfile(os.path.join(BASE_MODEL, "generation_config.json")):
-        generation_config = GenerationConfig.from_pretrained(
-            BASE_MODEL,
-             **gen_config,
-        )
-    else:
-        generation_config = GenerationConfig(**gen_config)
-    
-    # history.append({"role": "user", "content": prompt})
-    
-    input_ids = tokenizer.encode(prompt, return_tensors='pt')
-    from transformers.generation.streamers import TextStreamer
-    from transformers import StoppingCriteria, StoppingCriteriaList
-
-    class StopWordStoppingCriteria(StoppingCriteria):
-        """StopWord stopping criteria."""
-
-        def __init__(self, tokenizer, stop_word):
-            self.tokenizer = tokenizer
-            self.stop_word = stop_word
-            self.length = len(self.stop_word)
-
-        def __call__(self, input_ids, *args, **kwargs) -> bool:
-            cur_text = self.tokenizer.decode(input_ids[0])
-            cur_text = cur_text.replace('\r', '').replace('\n', '')
-            return cur_text[-self.length:] == self.stop_word
-
-    def get_stop_criteria(
-        tokenizer,
-        stop_words=[],
-    ):
-        stop_criteria = StoppingCriteriaList()
-        for word in stop_words:
-            stop_criteria.append(StopWordStoppingCriteria(tokenizer, word))
-        return stop_criteria
-    
-    stop_words:list[str] = []
-    stop_words += template.get('STOP_WORDS', [])
-    sep = template.get('SEP', '')
-    stop_criteria = get_stop_criteria(tokenizer=tokenizer, stop_words=stop_words)
-
-    streamer = TextStreamer(tokenizer, skip_prompt=True)  # type: ignore
 
     try:
-        if USE_FASTLLM:
-            # 流式传输：
-            output = []
-            for response in model.stream_chat(tokenizer, prompt, **gen_config):
-                output.append(response)
-                print(response, flush = True, end = "")
-            output = "".join(output)
-
-            # # 普通Chat：
-            # output = model.chat(tokenizer, now_instruction, **fastllm_config)
-            # print(output)
-        else:
-            with torch.no_grad():
-                generation_output = model.generate(
-                    input_ids=input_ids.cuda(), # type: ignore
-                    generation_config=generation_config,
-                    repetition_penalty=float(repetition_penalty),
-                    streamer=streamer,
-                    stopping_criteria=stop_criteria,
+        if USE_VLLM:
+            sampling_params = SamplingParams(
+                temperature=temperature, 
+                top_p=top_p,
+                top_k=top_k,
+                stop=cast(list, template.get('STOP_WORDS', [])),
+                max_tokens=max_new_tokens,
+                skip_special_tokens=False,
+                repetition_penalty=repetition_penalty
                 )
-            input_ids_len = input_ids.size(1) # type: ignore
-            response_ids = generation_output[:, input_ids_len:].cpu()
-            output = "".join(tokenizer.batch_decode(response_ids))
+            assert isinstance(model, LLM)
+            outputs = model.generate(prompt, sampling_params)
+            for i in outputs:
+                output = i.outputs[0].text
+
+        else:
+            assert isinstance(model, PeftModel) and tokenizer
+            gen_config = {
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "num_beams": num_beams,
+                "repetition_penalty": repetition_penalty,
+                "max_new_tokens": max_new_tokens,
+                "max_time": 30,
+                "do_sample": temperature > 0,
+                **kwargs,
+            }
+
+            if os.path.isfile(os.path.join(BASE_MODEL, "generation_config.json")):
+                generation_config = GenerationConfig.from_pretrained(
+                    BASE_MODEL,
+                    **gen_config,
+                )
+            else:
+                generation_config = GenerationConfig(**gen_config)
+            
+            # history.append({"role": "user", "content": prompt})
+            
+            input_ids = tokenizer.encode(prompt, return_tensors='pt')
+            from transformers.generation.streamers import TextStreamer
+            from transformers import StoppingCriteria, StoppingCriteriaList
+
+            class StopWordStoppingCriteria(StoppingCriteria):
+                """StopWord stopping criteria."""
+
+                def __init__(self, tokenizer, stop_word):
+                    self.tokenizer = tokenizer
+                    self.stop_word = stop_word
+                    self.length = len(self.stop_word)
+
+                def __call__(self, input_ids, *args, **kwargs) -> bool:
+                    cur_text = self.tokenizer.decode(input_ids[0])
+                    cur_text = cur_text.replace('\r', '').replace('\n', '')
+                    return cur_text[-self.length:] == self.stop_word
+
+            streamer = TextStreamer(tokenizer, skip_prompt=True)  # type: ignore
+
+            def get_stop_criteria(tokenizer, stop_words=[]):
+                stop_criteria = StoppingCriteriaList()
+                for word in stop_words:
+                    stop_criteria.append(StopWordStoppingCriteria(tokenizer, word))
+                return stop_criteria
+            
+            stop_words:list[str] = [stop_word]
+            for word in cast(list, template.get('STOP_WORDS', [])):
+                stop_words.append(word)
+            sep = template.get('SEP', '')
+            stop_criteria = get_stop_criteria(tokenizer=tokenizer, stop_words=stop_words)
+            if USE_FASTLLM:
+                # 流式传输：
+                output = []
+                for response in model.stream_chat(tokenizer, prompt, **gen_config):
+                    output.append(response)
+                    print(response, flush = True, end = "")
+                output = "".join(output)
+
+                # # 普通Chat：
+                # output = model.chat(tokenizer, now_instruction, **fastllm_config)
+                # print(output)
+            else:
+                with torch.no_grad():
+                    generation_output = model.generate(
+                        input_ids=input_ids.cuda(), # type: ignore
+                        generation_config=generation_config,
+                        repetition_penalty=float(repetition_penalty),
+                        streamer=streamer,
+                        stopping_criteria=stop_criteria,
+                    )
+                input_ids_len = input_ids.size(1) # type: ignore
+                response_ids = generation_output[:, input_ids_len:].cpu()
+                output = "".join(tokenizer.batch_decode(response_ids))
         
         print('output', output)
         print('###################\n')
@@ -295,7 +322,10 @@ if __name__ == "__main__":
         fn=evaluate,
         inputs=[
             gr.components.Textbox(
-                lines=2, label="Instruction", placeholder="在此输入任务/指令/历史", value=template['SYSTEM'].format(system=system_template) + template["INSTRUCTION"].format(input=message)
+                lines=2, label="Instruction", placeholder="在此输入任务/指令/历史", value=template['SYSTEM'].format(system=system_template) + template["INSTRUCTION"].format(input=message)  # type: ignore
+            ),
+            gr.components.Textbox(
+                lines=1, label="Stop Words", placeholder="在此输入停止词", value=""
             ),
             # gr.components.Textbox(
             #     lines=2, label="History", placeholder="这里输入历史记录"
@@ -313,6 +343,7 @@ if __name__ == "__main__":
             gr.components.Slider(
                 minimum=0.1, maximum=10.0, step=0.1, value=1.1, label="Repetition Penalty"
             ),
+            
             # gr.components.Slider(
             #     minimum=0, maximum=2000, step=1, value=256, label="Max memory"
             # ),
