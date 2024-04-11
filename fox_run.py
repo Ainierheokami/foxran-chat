@@ -183,7 +183,14 @@ if USE_FASTLLM:
     else:
         model = llm.from_hf(model, tokenizer)
 elif USE_VLLM:
-    model = LLM(model="models/Baichuan2-7B-awq", quantization="AWQ", trust_remote_code=True)
+    model = LLM(
+        model=BASE_MODEL, 
+        quantization="awq", 
+        trust_remote_code=True,  
+        # gpu_memory_utilization=0.95, 
+        # max_model_len=768,
+        # enforce_eager=True,
+        )
 else:
     # model.eval()
     if torch.__version__ >= "2" and sys.platform != "win32":
@@ -212,10 +219,12 @@ def evaluate(
                 temperature=temperature, 
                 top_p=top_p,
                 top_k=top_k,
-                stop=cast(list, template.get('STOP_WORDS', [])),
+                stop=cast(list, template.get('STOP_WORDS', [])) + stop_word.split(',') if "," in stop_word else [stop_word],
                 max_tokens=max_new_tokens,
                 skip_special_tokens=False,
-                repetition_penalty=repetition_penalty
+                repetition_penalty=repetition_penalty,
+                use_beam_search=False if num_beams == 1 else True,
+                best_of=num_beams if num_beams != 1 else None,         
                 )
             assert isinstance(model, LLM)
             outputs = model.generate(prompt, sampling_params)
@@ -335,7 +344,7 @@ if __name__ == "__main__":
             # ),
             gr.components.Slider(minimum=0, maximum=1, value=0.45, label="Temperature"),
             gr.components.Slider(minimum=0, maximum=1, value=0.9, label="Top p"),
-            gr.components.Slider(minimum=0, maximum=100, step=1, value=80, label="Top k"),
+            gr.components.Slider(minimum=-1, maximum=100, step=1, value=80, label="Top k"),
             gr.components.Slider(minimum=1, maximum=5, step=1, value=1, label="Beams"),
             gr.components.Slider(
                 minimum=1, maximum=2000, step=1, value=1024, label="Max new tokens"

@@ -1,8 +1,8 @@
 from awq import AutoAWQForCausalLM
 from transformers import AutoTokenizer
 
-model_path = 'models/Baichuan2-7B-merged'
-quant_path = 'models/Baichuan2-7B-awq'
+model_path = 'models/Qwen1.5-14B-lora-merge'
+quant_path = 'models/Qwen1.5-14B-awq'
 quant_config = { "zero_point": True, "q_group_size": 128, "w_bit": 4, "version": "GEMM" }
 
 # Load model
